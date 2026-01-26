@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/trogers1052/trading-journal/internal/database"
@@ -14,22 +15,44 @@ import (
 
 // JournalService orchestrates the trading journal workflow
 type JournalService struct {
-	repo            *database.Repository
-	bot             *telegram.Bot
+	repo             *database.Repository
+	bot              *telegram.Bot
 	pendingPositions []*models.Position // Queue of positions needing journal entries
+	catchupMode      bool               // True during startup Kafka replay - suppresses notifications
+	mu               sync.Mutex
 }
 
 // NewJournalService creates a new journal service
 func NewJournalService(repo *database.Repository, bot *telegram.Bot) *JournalService {
 	svc := &JournalService{
-		repo: repo,
-		bot:  bot,
+		repo:        repo,
+		bot:         bot,
+		catchupMode: true, // Start in catchup mode - will be disabled after initial Kafka replay
 	}
 
 	// Set up the callback for when journal entries are complete
 	bot.SetJournalCompleteCallback(svc.onJournalComplete)
 
 	return svc
+}
+
+// SetCatchupMode enables/disables catchup mode (suppresses notifications during Kafka replay)
+func (s *JournalService) SetCatchupMode(enabled bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.catchupMode = enabled
+	if enabled {
+		log.Println("Catchup mode enabled - notifications suppressed")
+	} else {
+		log.Println("Catchup mode disabled - live notifications enabled")
+	}
+}
+
+// IsCatchupMode returns whether we're in catchup mode
+func (s *JournalService) IsCatchupMode() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.catchupMode
 }
 
 // HandleTradeEvent processes a trade event from Kafka
@@ -150,13 +173,18 @@ func (s *JournalService) handleSellTrade(trade *models.Trade) error {
 	log.Printf("Closed position %d for %s (P&L: $%.2f)",
 		position.ID, trade.Symbol, *closedPosition.RealizedPL)
 
-	// Notify and start journal prompt
-	s.bot.SendPositionClosedNotification(closedPosition)
+	// Only send notifications if NOT in catchup mode (live trades only)
+	if !s.IsCatchupMode() {
+		// Notify and start journal prompt for live trades
+		s.bot.SendPositionClosedNotification(closedPosition)
 
-	// Start the journal prompt after a short delay
-	time.AfterFunc(2*time.Second, func() {
-		s.bot.StartJournalPrompt(closedPosition)
-	})
+		// Start the journal prompt after a short delay
+		time.AfterFunc(2*time.Second, func() {
+			s.bot.StartJournalPrompt(closedPosition)
+		})
+	} else {
+		log.Printf("Catchup mode: skipping notification for %s", trade.Symbol)
+	}
 
 	return nil
 }
@@ -184,19 +212,22 @@ func (s *JournalService) CatchUpPendingJournals() error {
 
 	if len(positions) == 0 {
 		log.Println("All positions have journal entries")
+		s.bot.SendMessage("✅ All trades have been journaled!")
 		return nil
 	}
 
 	log.Printf("Found %d positions without journal entries", len(positions))
 
 	// Store pending positions
+	s.mu.Lock()
 	s.pendingPositions = positions
+	s.mu.Unlock()
 
-	// Send summary
-	s.bot.SendPendingJournalsSummary(positions)
+	// Send a simple count message, not the full list
+	s.bot.SendMessage(fmt.Sprintf("📋 You have %d trades pending journal entries. Let's go through them one at a time.", len(positions)))
 
 	// Start with the first one after a delay
-	time.AfterFunc(3*time.Second, func() {
+	time.AfterFunc(2*time.Second, func() {
 		s.promptNextPendingPosition()
 	})
 
@@ -205,18 +236,28 @@ func (s *JournalService) CatchUpPendingJournals() error {
 
 // promptNextPendingPosition prompts for the next pending position
 func (s *JournalService) promptNextPendingPosition() {
+	s.mu.Lock()
 	if len(s.pendingPositions) == 0 {
+		s.mu.Unlock()
+		log.Println("No more pending positions to journal")
+		s.bot.SendMessage("🎉 All caught up! No more trades to journal.")
 		return
 	}
 
 	// Don't start a new prompt if one is already active
 	if s.bot.HasActivePrompt() {
+		s.mu.Unlock()
+		log.Println("Active prompt in progress, waiting...")
 		return
 	}
 
 	// Get the next position
 	position := s.pendingPositions[0]
 	s.pendingPositions = s.pendingPositions[1:]
+	remaining := len(s.pendingPositions)
+	s.mu.Unlock()
+
+	log.Printf("Prompting for position %d (%s), %d remaining", position.ID, position.Symbol, remaining)
 
 	// Start the journal prompt
 	s.bot.StartJournalPrompt(position)

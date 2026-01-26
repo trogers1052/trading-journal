@@ -367,12 +367,17 @@ func (b *Bot) HasActivePrompt() bool {
 	return len(b.activePrompts) > 0
 }
 
-// sendMessage sends a plain text message
+// sendMessage sends a plain text message (internal)
 func (b *Bot) sendMessage(text string) {
 	msg := tgbotapi.NewMessage(b.chatID, text)
 	if _, err := b.api.Send(msg); err != nil {
 		log.Printf("Failed to send message: %v", err)
 	}
+}
+
+// SendMessage sends a plain text message (public)
+func (b *Bot) SendMessage(text string) {
+	b.sendMessage(text)
 }
 
 // sendHTMLMessage sends an HTML-formatted message
