@@ -76,26 +76,37 @@ func main() {
 
 	log.Println("Trading journal service running...")
 
-	// Send startup notification
-	bot.SendStats(map[string]interface{}{
-		"total_positions":     0,
-		"closed_positions":    0,
-		"journaled_positions": 0,
-		"pending_journals":    0,
-		"wins":                0,
-		"losses":              0,
-		"win_rate":            0.0,
-		"total_pl":            0.0,
-		"avg_rating":          0.0,
-	})
+	// Wait for Kafka to catch up with historical trades, then disable catchup mode
+	// and start prompting for pending journal entries one at a time
+	time.AfterFunc(10*time.Second, func() {
+		log.Println("Kafka catchup period complete, switching to live mode...")
+		journalService.SetCatchupMode(false)
 
-	// Catch up on pending journal entries after a short delay
-	// This gives time for Kafka to start consuming historical trades
-	time.AfterFunc(5*time.Second, func() {
-		log.Println("Checking for pending journal entries...")
-		if err := journalService.CatchUpPendingJournals(); err != nil {
-			log.Printf("Warning: failed to catch up pending journals: %v", err)
+		// Get stats and send startup notification
+		stats, err := journalService.GetStats()
+		if err != nil {
+			log.Printf("Warning: failed to get stats: %v", err)
+			stats = map[string]interface{}{
+				"total_positions":     0,
+				"closed_positions":    0,
+				"journaled_positions": 0,
+				"pending_journals":    0,
+				"wins":                0,
+				"losses":              0,
+				"win_rate":            0.0,
+				"total_pl":            0.0,
+				"avg_rating":          0.0,
+			}
 		}
+		bot.SendStats(stats)
+
+		// Now check for pending journal entries and prompt one at a time
+		time.AfterFunc(2*time.Second, func() {
+			log.Println("Checking for pending journal entries...")
+			if err := journalService.CatchUpPendingJournals(); err != nil {
+				log.Printf("Warning: failed to catch up pending journals: %v", err)
+			}
+		})
 	})
 
 	// Wait for shutdown signal
