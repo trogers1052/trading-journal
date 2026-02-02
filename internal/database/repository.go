@@ -75,7 +75,16 @@ func (r *Repository) initSchema() error {
 		realized_pl_pct DECIMAL(10, 4),
 		holding_days INTEGER,
 		status VARCHAR(20) DEFAULT 'open',
-		created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+		created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+		-- Analysis columns (populated by reporting-service)
+		rule_compliance_score DECIMAL(10, 4),
+		entry_signal_confidence DECIMAL(10, 4),
+		entry_signal_type VARCHAR(20),
+		position_size_deviation DECIMAL(10, 4),
+		exit_type VARCHAR(50),
+		risk_metrics_at_entry JSONB,
+		analysis_notes TEXT,
+		analyzed_at TIMESTAMP WITH TIME ZONE
 	);
 
 	-- Journal entries table
@@ -103,10 +112,44 @@ func (r *Repository) initSchema() error {
 	CREATE INDEX IF NOT EXISTS idx_journal_positions_symbol ON journal_positions(symbol);
 	CREATE INDEX IF NOT EXISTS idx_journal_positions_status ON journal_positions(status);
 	CREATE INDEX IF NOT EXISTS idx_journal_entries_position_id ON journal_entries(position_id);
+	CREATE INDEX IF NOT EXISTS idx_journal_positions_compliance_score ON journal_positions(rule_compliance_score);
+	CREATE INDEX IF NOT EXISTS idx_journal_positions_exit_type ON journal_positions(exit_type);
+	CREATE INDEX IF NOT EXISTS idx_journal_positions_analyzed_at ON journal_positions(analyzed_at);
+	CREATE INDEX IF NOT EXISTS idx_journal_positions_entry_signal_type ON journal_positions(entry_signal_type);
 	`
 
 	_, err := r.db.Exec(schema)
-	return err
+	if err != nil {
+		return err
+	}
+
+	// Run migrations to add columns to existing tables
+	return r.runMigrations()
+}
+
+// runMigrations adds new columns to existing tables
+func (r *Repository) runMigrations() error {
+	// Add analysis columns to journal_positions if they don't exist
+	// These are added to the CREATE TABLE now, but this handles existing tables
+	migrations := []string{
+		`ALTER TABLE journal_positions ADD COLUMN IF NOT EXISTS rule_compliance_score DECIMAL(10, 4)`,
+		`ALTER TABLE journal_positions ADD COLUMN IF NOT EXISTS entry_signal_confidence DECIMAL(10, 4)`,
+		`ALTER TABLE journal_positions ADD COLUMN IF NOT EXISTS entry_signal_type VARCHAR(20)`,
+		`ALTER TABLE journal_positions ADD COLUMN IF NOT EXISTS position_size_deviation DECIMAL(10, 4)`,
+		`ALTER TABLE journal_positions ADD COLUMN IF NOT EXISTS exit_type VARCHAR(50)`,
+		`ALTER TABLE journal_positions ADD COLUMN IF NOT EXISTS risk_metrics_at_entry JSONB`,
+		`ALTER TABLE journal_positions ADD COLUMN IF NOT EXISTS analysis_notes TEXT`,
+		`ALTER TABLE journal_positions ADD COLUMN IF NOT EXISTS analyzed_at TIMESTAMP WITH TIME ZONE`,
+	}
+
+	for _, migration := range migrations {
+		if _, err := r.db.Exec(migration); err != nil {
+			// Log but don't fail - column might already exist in older PostgreSQL versions
+			log.Printf("Migration note: %v", err)
+		}
+	}
+
+	return nil
 }
 
 // InsertTrade inserts a new trade record
