@@ -106,16 +106,12 @@ func (r *Repository) initSchema() error {
 		updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 	);
 
-	-- Indexes
+	-- Indexes (only for columns that exist in original schema)
 	CREATE INDEX IF NOT EXISTS idx_journal_trades_symbol ON journal_trades(symbol);
 	CREATE INDEX IF NOT EXISTS idx_journal_trades_executed_at ON journal_trades(executed_at);
 	CREATE INDEX IF NOT EXISTS idx_journal_positions_symbol ON journal_positions(symbol);
 	CREATE INDEX IF NOT EXISTS idx_journal_positions_status ON journal_positions(status);
 	CREATE INDEX IF NOT EXISTS idx_journal_entries_position_id ON journal_entries(position_id);
-	CREATE INDEX IF NOT EXISTS idx_journal_positions_compliance_score ON journal_positions(rule_compliance_score);
-	CREATE INDEX IF NOT EXISTS idx_journal_positions_exit_type ON journal_positions(exit_type);
-	CREATE INDEX IF NOT EXISTS idx_journal_positions_analyzed_at ON journal_positions(analyzed_at);
-	CREATE INDEX IF NOT EXISTS idx_journal_positions_entry_signal_type ON journal_positions(entry_signal_type);
 	`
 
 	_, err := r.db.Exec(schema)
@@ -146,6 +142,20 @@ func (r *Repository) runMigrations() error {
 		if _, err := r.db.Exec(migration); err != nil {
 			// Log but don't fail - column might already exist in older PostgreSQL versions
 			log.Printf("Migration note: %v", err)
+		}
+	}
+
+	// Create indexes for the new columns (after columns exist)
+	indexes := []string{
+		`CREATE INDEX IF NOT EXISTS idx_journal_positions_compliance_score ON journal_positions(rule_compliance_score)`,
+		`CREATE INDEX IF NOT EXISTS idx_journal_positions_exit_type ON journal_positions(exit_type)`,
+		`CREATE INDEX IF NOT EXISTS idx_journal_positions_analyzed_at ON journal_positions(analyzed_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_journal_positions_entry_signal_type ON journal_positions(entry_signal_type)`,
+	}
+
+	for _, idx := range indexes {
+		if _, err := r.db.Exec(idx); err != nil {
+			log.Printf("Index creation note: %v", err)
 		}
 	}
 
