@@ -1,6 +1,10 @@
 package models
 
 import (
+	"fmt"
+	"math"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -121,4 +125,102 @@ var JournalQuestions = map[int]string{
 	StepWouldRepeat:     "Would you take this same trade again? (yes/no)",
 	StepRating:          "Rate this trade 1-5 (1=poor decision, 5=excellent execution)",
 	StepNotes:           "Any additional notes? (or type 'skip' to finish)",
+}
+
+// MaxSymbolLength is the maximum allowed length for a stock symbol.
+const MaxSymbolLength = 10
+
+// ValidateTradeEvent checks that a TradeEvent from Kafka has all required
+// fields present and sane before allowing it to propagate through the system.
+// Returns a descriptive error if validation fails, nil otherwise.
+func ValidateTradeEvent(event *TradeEvent) error {
+	if event == nil {
+		return fmt.Errorf("trade event is nil")
+	}
+
+	if strings.TrimSpace(event.EventType) == "" {
+		return fmt.Errorf("missing event_type")
+	}
+
+	d := event.Data
+
+	// --- Symbol ---
+	symbol := strings.TrimSpace(d.Symbol)
+	if symbol == "" {
+		return fmt.Errorf("missing or empty symbol")
+	}
+	if len(symbol) > MaxSymbolLength {
+		return fmt.Errorf("symbol %q exceeds max length of %d", symbol, MaxSymbolLength)
+	}
+
+	// --- Side ---
+	side := strings.ToLower(strings.TrimSpace(d.Side))
+	if side != "buy" && side != "sell" {
+		return fmt.Errorf("invalid side %q: must be 'buy' or 'sell'", d.Side)
+	}
+
+	// --- Quantity ---
+	if strings.TrimSpace(d.Quantity) == "" {
+		return fmt.Errorf("missing quantity")
+	}
+	qty, err := strconv.ParseFloat(d.Quantity, 64)
+	if err != nil {
+		return fmt.Errorf("quantity %q is not a valid number: %w", d.Quantity, err)
+	}
+	if !isFinitePositive(qty) {
+		return fmt.Errorf("quantity must be a finite positive number, got %v", qty)
+	}
+
+	// --- Average Price ---
+	if strings.TrimSpace(d.AveragePrice) == "" {
+		return fmt.Errorf("missing average_price")
+	}
+	price, err := strconv.ParseFloat(d.AveragePrice, 64)
+	if err != nil {
+		return fmt.Errorf("average_price %q is not a valid number: %w", d.AveragePrice, err)
+	}
+	if !isFinitePositive(price) {
+		return fmt.Errorf("average_price must be a finite positive number, got %v", price)
+	}
+
+	// --- Total Notional ---
+	if strings.TrimSpace(d.TotalNotional) == "" {
+		return fmt.Errorf("missing total_notional")
+	}
+	notional, err := strconv.ParseFloat(d.TotalNotional, 64)
+	if err != nil {
+		return fmt.Errorf("total_notional %q is not a valid number: %w", d.TotalNotional, err)
+	}
+	if !isFiniteNonNegative(notional) {
+		return fmt.Errorf("total_notional must be a finite non-negative number, got %v", notional)
+	}
+
+	// --- Fees (allowed to be zero) ---
+	if strings.TrimSpace(d.Fees) == "" {
+		return fmt.Errorf("missing fees")
+	}
+	fees, err := strconv.ParseFloat(d.Fees, 64)
+	if err != nil {
+		return fmt.Errorf("fees %q is not a valid number: %w", d.Fees, err)
+	}
+	if !isFiniteNonNegative(fees) {
+		return fmt.Errorf("fees must be a finite non-negative number, got %v", fees)
+	}
+
+	// --- Order ID ---
+	if strings.TrimSpace(d.OrderID) == "" {
+		return fmt.Errorf("missing order_id")
+	}
+
+	return nil
+}
+
+// isFinitePositive returns true if v is a normal positive finite number (> 0).
+func isFinitePositive(v float64) bool {
+	return !math.IsNaN(v) && !math.IsInf(v, 0) && v > 0
+}
+
+// isFiniteNonNegative returns true if v is a normal non-negative finite number (>= 0).
+func isFiniteNonNegative(v float64) bool {
+	return !math.IsNaN(v) && !math.IsInf(v, 0) && v >= 0
 }

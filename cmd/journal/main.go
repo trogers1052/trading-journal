@@ -16,6 +16,11 @@ import (
 	"github.com/trogers1052/trading-journal/internal/telegram"
 )
 
+// shutdownTimeout is the maximum time allowed for graceful shutdown before
+// the process exits forcefully. This prevents the service from hanging
+// indefinitely if a resource (Kafka, DB, etc.) fails to close.
+const shutdownTimeout = 15 * time.Second
+
 func main() {
 	log.Println("Starting trading-journal service...")
 
@@ -24,12 +29,17 @@ func main() {
 	if healthPort == "" {
 		healthPort = "8080"
 	}
-	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("ok")) //nolint:errcheck
 	})
+	healthServer := &http.Server{
+		Addr:    ":" + healthPort,
+		Handler: mux,
+	}
 	go func() {
-		if err := http.ListenAndServe(":"+healthPort, nil); err != nil {
+		if err := healthServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Printf("Health server error: %v", err)
 		}
 	}()
@@ -51,7 +61,6 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to connect to database: %v", err)
 	}
-	defer repo.Close()
 
 	// Create Telegram bot
 	bot, err := telegram.NewBot(cfg.TelegramBotToken, cfg.TelegramChatID)
@@ -71,20 +80,17 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to create Kafka consumer: %v", err)
 	}
-	defer consumer.Close()
 
 	// Set up trade handler
 	consumer.SetTradeHandler(journalService.HandleTradeEvent)
 
-	// Create context with cancellation
+	// Create context with cancellation — all long-running goroutines use this
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	// Start Telegram bot
 	if err := bot.Start(ctx); err != nil {
 		log.Fatalf("Failed to start Telegram bot: %v", err)
 	}
-	defer bot.Stop()
 
 	// Start Kafka consumer
 	if err := consumer.Start(ctx); err != nil {
@@ -127,17 +133,61 @@ func main() {
 		})
 	})
 
-	// Wait for shutdown signal
+	// ---- Wait for OS shutdown signal (SIGINT / SIGTERM) ----
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	<-sigChan
+	sig := <-sigChan
 
-	log.Println("Shutting down trading-journal service...")
+	log.Printf("Received signal %v — initiating graceful shutdown (timeout %s)...", sig, shutdownTimeout)
+
+	// Stop accepting new work immediately
 	catchupTimer.Stop()
 	if pendingTimer != nil {
 		pendingTimer.Stop()
 	}
+
+	// Cancel the root context so all goroutines (Kafka consumer, Telegram bot,
+	// timers) begin draining.
 	cancel()
 
-	log.Println("Trading journal service stopped")
+	// Perform resource cleanup under a deadline so a hung resource cannot
+	// block the process from exiting.
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer shutdownCancel()
+
+	// Channel to signal that cleanup finished before the deadline.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+
+		// 1. Shut down the health HTTP server so readiness probes start failing.
+		log.Println("Shutting down health server...")
+		if err := healthServer.Shutdown(shutdownCtx); err != nil {
+			log.Printf("Warning: health server shutdown error: %v", err)
+		}
+
+		// 2. Close Kafka consumer (waits for in-flight message processing).
+		log.Println("Closing Kafka consumer...")
+		if err := consumer.Close(); err != nil {
+			log.Printf("Warning: Kafka consumer close error: %v", err)
+		}
+
+		// 3. Stop Telegram bot.
+		log.Println("Stopping Telegram bot...")
+		bot.Stop()
+
+		// 4. Close database connection pool last (other components may still
+		//    flush writes during their own shutdown).
+		log.Println("Closing database connection...")
+		if err := repo.Close(); err != nil {
+			log.Printf("Warning: database close error: %v", err)
+		}
+	}()
+
+	select {
+	case <-done:
+		log.Println("Trading journal service stopped gracefully")
+	case <-shutdownCtx.Done():
+		log.Println("WARNING: Graceful shutdown timed out — exiting forcefully")
+	}
 }

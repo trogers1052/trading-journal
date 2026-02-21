@@ -103,6 +103,16 @@ func (h *consumerGroupHandler) Cleanup(sarama.ConsumerGroupSession) error {
 	return nil
 }
 
+// truncateBytes returns at most maxLen bytes of b as a string, appending
+// "...(truncated)" if the input was longer. Useful for safe logging of
+// potentially large or malformed Kafka message payloads.
+func truncateBytes(b []byte, maxLen int) string {
+	if len(b) <= maxLen {
+		return string(b)
+	}
+	return string(b[:maxLen]) + "...(truncated)"
+}
+
 func (h *consumerGroupHandler) ConsumeClaim(session sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
 	for {
 		select {
@@ -116,7 +126,15 @@ func (h *consumerGroupHandler) ConsumeClaim(session sarama.ConsumerGroupSession,
 			if h.consumer.tradeHandler != nil {
 				var event models.TradeEvent
 				if err := json.Unmarshal(message.Value, &event); err != nil {
-					log.Printf("Failed to unmarshal trade event: %v", err)
+					log.Printf("WARNING: Rejecting malformed trade event (unmarshal failed): %v | raw: %s", err, truncateBytes(message.Value, 256))
+					session.MarkMessage(message, "")
+					continue
+				}
+
+				// Validate required fields before processing
+				if err := models.ValidateTradeEvent(&event); err != nil {
+					log.Printf("WARNING: Rejecting invalid trade event: %v | event_type=%s order_id=%s symbol=%s",
+						err, event.EventType, event.Data.OrderID, event.Data.Symbol)
 					session.MarkMessage(message, "")
 					continue
 				}
