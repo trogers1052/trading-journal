@@ -339,10 +339,16 @@ func (r *Repository) ClosePosition(positionID int64, exitTrade *models.Trade) er
 		return fmt.Errorf("failed to query entry fees for position %d: %w", positionID, err)
 	}
 
-	// Calculate P&L (subtract both entry and exit fees)
-	realizedPL := (exitTrade.Price*exitTrade.Quantity - exitTrade.Fees) - (position.EntryPrice*exitTrade.Quantity + entryFees)
+	// Prorate entry fees for partial sells
+	proratedEntryFees := entryFees
+	if position.Quantity > 0 && exitTrade.Quantity < position.Quantity {
+		proratedEntryFees = entryFees * (exitTrade.Quantity / position.Quantity)
+	}
+
+	// Calculate P&L (subtract both prorated entry and exit fees)
+	realizedPL := (exitTrade.Price*exitTrade.Quantity - exitTrade.Fees) - (position.EntryPrice*exitTrade.Quantity + proratedEntryFees)
 	// P&L percentage includes fees for accurate return tracking
-	totalCost := position.EntryPrice*exitTrade.Quantity + entryFees
+	totalCost := position.EntryPrice*exitTrade.Quantity + proratedEntryFees
 	realizedPLPct := 0.0
 	if totalCost > 0 {
 		realizedPLPct = (realizedPL / totalCost) * 100
@@ -572,6 +578,208 @@ func (r *Repository) GetRecentClosedPositions(limit int) ([]*models.Position, er
 func (r *Repository) UpdateTradePositionID(orderID string, positionID int64) error {
 	query := `UPDATE journal_trades SET position_id = $1 WHERE order_id = $2`
 	_, err := r.db.Exec(query, positionID, orderID)
+	return err
+}
+
+// InsertTradeAndOpenPosition atomically inserts a buy trade, creates a new
+// position, and links them together. Returns the created position. Returns
+// ErrDuplicateTrade if the trade's order_id already exists.
+// riskMetrics is optional JSONB data to store in risk_metrics_at_entry (nil to skip).
+func (r *Repository) InsertTradeAndOpenPosition(trade *models.Trade, riskMetrics []byte) (*models.Position, error) {
+	tx, err := r.db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Insert the trade
+	if err := r.insertTradeWithTx(tx, trade); err != nil {
+		return nil, err
+	}
+
+	// Create the position
+	position, err := r.createPositionWithTx(tx, trade, riskMetrics)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create position: %w", err)
+	}
+
+	// Link trade to position
+	if _, err := tx.Exec(
+		`UPDATE journal_trades SET position_id = $1 WHERE order_id = $2`,
+		position.ID, trade.OrderID,
+	); err != nil {
+		return nil, fmt.Errorf("failed to link trade to position: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	return position, nil
+}
+
+// InsertTradeAndClosePosition atomically inserts a sell trade, closes the
+// given position with P&L calculation, and links them together. Returns
+// ErrDuplicateTrade if the trade's order_id already exists.
+func (r *Repository) InsertTradeAndClosePosition(trade *models.Trade, positionID int64) error {
+	tx, err := r.db.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Insert the trade
+	if err := r.insertTradeWithTx(tx, trade); err != nil {
+		return err
+	}
+
+	// Close the position
+	if err := r.closePositionWithTx(tx, positionID, trade); err != nil {
+		return fmt.Errorf("failed to close position: %w", err)
+	}
+
+	// Link trade to position
+	if _, err := tx.Exec(
+		`UPDATE journal_trades SET position_id = $1 WHERE order_id = $2`,
+		positionID, trade.OrderID,
+	); err != nil {
+		return fmt.Errorf("failed to link trade to position: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	return nil
+}
+
+// insertTradeWithTx is the transactional variant of InsertTrade.
+func (r *Repository) insertTradeWithTx(tx *sql.Tx, trade *models.Trade) error {
+	if trade.OrderID == "" {
+		return fmt.Errorf("trade has empty order_id: cannot safely deduplicate")
+	}
+
+	query := `
+		INSERT INTO journal_trades (order_id, symbol, side, quantity, price, total_amount, fees, executed_at, position_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		ON CONFLICT (order_id) DO NOTHING
+		RETURNING id
+	`
+
+	err := tx.QueryRow(
+		query,
+		trade.OrderID,
+		trade.Symbol,
+		trade.Side,
+		trade.Quantity,
+		trade.Price,
+		trade.TotalAmount,
+		trade.Fees,
+		trade.ExecutedAt,
+		trade.PositionID,
+	).Scan(&trade.ID)
+
+	if err != sql.ErrNoRows {
+		return err
+	}
+
+	// ON CONFLICT DO NOTHING — duplicate trade
+	fetchErr := tx.QueryRow(
+		`SELECT id FROM journal_trades WHERE order_id = $1`,
+		trade.OrderID,
+	).Scan(&trade.ID)
+	if fetchErr != nil {
+		return fmt.Errorf("trade conflict detected but could not fetch existing id: %w", fetchErr)
+	}
+
+	return ErrDuplicateTrade
+}
+
+// createPositionWithTx is the transactional variant of CreatePosition.
+// riskMetrics is optional JSONB data (nil stores SQL NULL).
+func (r *Repository) createPositionWithTx(tx *sql.Tx, trade *models.Trade, riskMetrics []byte) (*models.Position, error) {
+	query := `
+		INSERT INTO journal_positions (symbol, entry_order_id, entry_price, quantity, entry_date, status, risk_metrics_at_entry)
+		VALUES ($1, $2, $3, $4, $5, 'open', $6)
+		RETURNING id, created_at
+	`
+
+	position := &models.Position{
+		Symbol:       trade.Symbol,
+		EntryOrderID: trade.OrderID,
+		EntryPrice:   trade.Price,
+		Quantity:     trade.Quantity,
+		EntryDate:    trade.ExecutedAt,
+		Status:       "open",
+	}
+
+	// Convert nil to sql.NULL for the JSONB column
+	var riskMetricsParam any
+	if riskMetrics != nil {
+		riskMetricsParam = riskMetrics
+	}
+
+	err := tx.QueryRow(
+		query,
+		position.Symbol,
+		position.EntryOrderID,
+		position.EntryPrice,
+		position.Quantity,
+		position.EntryDate,
+		riskMetricsParam,
+	).Scan(&position.ID, &position.CreatedAt)
+
+	return position, err
+}
+
+// closePositionWithTx is the transactional variant of ClosePosition.
+func (r *Repository) closePositionWithTx(tx *sql.Tx, positionID int64, exitTrade *models.Trade) error {
+	position, err := r.GetPositionByID(positionID)
+	if err != nil {
+		return err
+	}
+
+	var entryFees float64
+	err = tx.QueryRow(
+		`SELECT COALESCE(SUM(fees), 0) FROM journal_trades WHERE position_id = $1 AND side = 'buy'`,
+		positionID,
+	).Scan(&entryFees)
+	if err != nil {
+		return fmt.Errorf("failed to query entry fees for position %d: %w", positionID, err)
+	}
+
+	// Prorate entry fees for partial sells
+	proratedEntryFees := entryFees
+	if position.Quantity > 0 && exitTrade.Quantity < position.Quantity {
+		proratedEntryFees = entryFees * (exitTrade.Quantity / position.Quantity)
+	}
+
+	realizedPL := (exitTrade.Price*exitTrade.Quantity - exitTrade.Fees) - (position.EntryPrice*exitTrade.Quantity + proratedEntryFees)
+	totalCost := position.EntryPrice*exitTrade.Quantity + proratedEntryFees
+	realizedPLPct := 0.0
+	if totalCost > 0 {
+		realizedPLPct = (realizedPL / totalCost) * 100
+	}
+	holdingDays := int(exitTrade.ExecutedAt.Sub(position.EntryDate).Hours() / 24)
+
+	query := `
+		UPDATE journal_positions
+		SET exit_order_id = $1, exit_price = $2, exit_date = $3,
+		    realized_pl = $4, realized_pl_pct = $5, holding_days = $6, status = 'closed'
+		WHERE id = $7
+	`
+
+	_, err = tx.Exec(
+		query,
+		exitTrade.OrderID,
+		exitTrade.Price,
+		exitTrade.ExecutedAt,
+		realizedPL,
+		realizedPLPct,
+		holdingDays,
+		positionID,
+	)
+
 	return err
 }
 

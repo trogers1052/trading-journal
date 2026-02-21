@@ -25,6 +25,11 @@ type Config struct {
 	TelegramBotToken string
 	TelegramChatID   int64
 
+	// Redis (for risk metrics snapshot at trade entry)
+	RedisAddr     string
+	RedisPassword string
+	RedisDB       int
+
 	// Journal settings
 	JournalPromptTimeout int // Minutes to wait for journal entry before reminder
 }
@@ -47,6 +52,11 @@ func Load() (*Config, error) {
 		// Telegram
 		TelegramBotToken: getEnv("TELEGRAM_JOURNAL_BOT_TOKEN", ""),
 		TelegramChatID:   getEnvInt64("TELEGRAM_JOURNAL_CHAT_ID", 0),
+
+		// Redis
+		RedisAddr:     getEnv("REDIS_ADDR", "localhost:6379"),
+		RedisPassword: getEnv("REDIS_PASSWORD", ""),
+		RedisDB:       getEnvInt("REDIS_DB", 0),
 
 		// Journal settings
 		JournalPromptTimeout: getEnvInt("JOURNAL_PROMPT_TIMEOUT", 60),
