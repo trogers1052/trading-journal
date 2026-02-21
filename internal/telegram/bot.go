@@ -60,8 +60,32 @@ func (b *Bot) Start(ctx context.Context) error {
 
 	go b.processUpdates()
 
+	go func() {
+		ticker := time.NewTicker(1 * time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-b.ctx.Done():
+				return
+			case <-ticker.C:
+				b.cleanupStalePrompts()
+			}
+		}
+	}()
+
 	log.Println("Telegram bot started, listening for messages...")
 	return nil
+}
+
+func (b *Bot) cleanupStalePrompts() {
+	b.promptsMu.Lock()
+	defer b.promptsMu.Unlock()
+	cutoff := time.Now().Add(-24 * time.Hour)
+	for posID, state := range b.activePrompts {
+		if state.LastPromptAt.Before(cutoff) {
+			delete(b.activePrompts, posID)
+		}
+	}
 }
 
 // Stop stops the bot

@@ -64,10 +64,22 @@ func (s *JournalService) HandleTradeEvent(ctx context.Context, event *models.Tra
 		data.Side, data.Quantity, data.Symbol, data.AveragePrice)
 
 	// Parse trade data
-	quantity, _ := strconv.ParseFloat(data.Quantity, 64)
-	price, _ := strconv.ParseFloat(data.AveragePrice, 64)
-	totalAmount, _ := strconv.ParseFloat(data.TotalNotional, 64)
-	fees, _ := strconv.ParseFloat(data.Fees, 64)
+	quantity, err := strconv.ParseFloat(data.Quantity, 64)
+	if err != nil {
+		return fmt.Errorf("invalid quantity %q: %w", data.Quantity, err)
+	}
+	price, err := strconv.ParseFloat(data.AveragePrice, 64)
+	if err != nil {
+		return fmt.Errorf("invalid price %q: %w", data.AveragePrice, err)
+	}
+	totalAmount, err := strconv.ParseFloat(data.TotalNotional, 64)
+	if err != nil {
+		return fmt.Errorf("invalid total notional %q: %w", data.TotalNotional, err)
+	}
+	fees, err := strconv.ParseFloat(data.Fees, 64)
+	if err != nil {
+		return fmt.Errorf("invalid fees %q: %w", data.Fees, err)
+	}
 
 	var executedAt time.Time
 	if data.ExecutedAt != nil {
