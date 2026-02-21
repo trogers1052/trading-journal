@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"time"
 
 	"github.com/lib/pq"
 	"github.com/trogers1052/trading-journal/internal/models"
@@ -26,6 +27,10 @@ func NewRepository(dsn string) (*Repository, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
+
+	db.SetMaxOpenConns(10)
+	db.SetMaxIdleConns(5)
+	db.SetConnMaxLifetime(5 * time.Minute)
 
 	// Test connection
 	if err := db.Ping(); err != nil {
@@ -324,8 +329,18 @@ func (r *Repository) ClosePosition(positionID int64, exitTrade *models.Trade) er
 		return err
 	}
 
-	// Calculate P&L
-	realizedPL := (exitTrade.Price*exitTrade.Quantity - exitTrade.Fees) - (position.EntryPrice * exitTrade.Quantity)
+	// Sum entry fees from all buy trades linked to this position
+	var entryFees float64
+	err = r.db.QueryRow(
+		`SELECT COALESCE(SUM(fees), 0) FROM journal_trades WHERE position_id = $1 AND side = 'buy'`,
+		positionID,
+	).Scan(&entryFees)
+	if err != nil {
+		return fmt.Errorf("failed to query entry fees for position %d: %w", positionID, err)
+	}
+
+	// Calculate P&L (subtract both entry and exit fees)
+	realizedPL := (exitTrade.Price*exitTrade.Quantity - exitTrade.Fees) - (position.EntryPrice*exitTrade.Quantity + entryFees)
 	realizedPLPct := ((exitTrade.Price - position.EntryPrice) / position.EntryPrice) * 100
 	holdingDays := int(exitTrade.ExecutedAt.Sub(position.EntryDate).Hours() / 24)
 

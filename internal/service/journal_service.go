@@ -83,9 +83,19 @@ func (s *JournalService) HandleTradeEvent(ctx context.Context, event *models.Tra
 
 	var executedAt time.Time
 	if data.ExecutedAt != nil {
-		executedAt, _ = time.Parse(time.RFC3339, *data.ExecutedAt)
+		var parseErr error
+		executedAt, parseErr = time.Parse(time.RFC3339, *data.ExecutedAt)
+		if parseErr != nil {
+			executedAt, parseErr = time.Parse(time.RFC3339Nano, *data.ExecutedAt)
+			if parseErr != nil {
+				return fmt.Errorf("failed to parse trade timestamp %q: %w", *data.ExecutedAt, parseErr)
+			}
+		}
 	} else {
 		executedAt = event.Timestamp
+	}
+	if executedAt.IsZero() {
+		return fmt.Errorf("invalid trade timestamp")
 	}
 
 	trade := &models.Trade{

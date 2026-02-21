@@ -95,7 +95,8 @@ func main() {
 
 	// Wait for Kafka to catch up with historical trades, then disable catchup mode
 	// and start prompting for pending journal entries one at a time
-	time.AfterFunc(10*time.Second, func() {
+	var pendingTimer *time.Timer
+	catchupTimer := time.AfterFunc(10*time.Second, func() {
 		log.Println("Kafka catchup period complete, switching to live mode...")
 		journalService.SetCatchupMode(false)
 
@@ -118,7 +119,7 @@ func main() {
 		bot.SendStats(stats)
 
 		// Now check for pending journal entries and prompt one at a time
-		time.AfterFunc(2*time.Second, func() {
+		pendingTimer = time.AfterFunc(2*time.Second, func() {
 			log.Println("Checking for pending journal entries...")
 			if err := journalService.CatchUpPendingJournals(); err != nil {
 				log.Printf("Warning: failed to catch up pending journals: %v", err)
@@ -132,6 +133,10 @@ func main() {
 	<-sigChan
 
 	log.Println("Shutting down trading-journal service...")
+	catchupTimer.Stop()
+	if pendingTimer != nil {
+		pendingTimer.Stop()
+	}
 	cancel()
 
 	log.Println("Trading journal service stopped")
