@@ -1,6 +1,7 @@
 package models
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
 	"strconv"
@@ -59,8 +60,9 @@ type Position struct {
 	RealizedPL     *float64   `json:"realized_pl,omitempty"`      // Profit/Loss in dollars
 	RealizedPLPct  *float64   `json:"realized_pl_pct,omitempty"`  // Profit/Loss percentage
 	Status         string     `json:"status"`                     // open, closed
-	HoldingDays    *int       `json:"holding_days,omitempty"`
-	CreatedAt      time.Time  `json:"created_at"`
+	HoldingDays        *int             `json:"holding_days,omitempty"`
+	RiskMetricsAtEntry json.RawMessage  `json:"risk_metrics_at_entry,omitempty"`
+	CreatedAt          time.Time        `json:"created_at"`
 }
 
 // JournalEntry represents a user's journal entry for a closed position

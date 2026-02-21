@@ -12,6 +12,7 @@ import (
 	"github.com/trogers1052/trading-journal/internal/config"
 	"github.com/trogers1052/trading-journal/internal/database"
 	"github.com/trogers1052/trading-journal/internal/kafka"
+	tjredis "github.com/trogers1052/trading-journal/internal/redis"
 	"github.com/trogers1052/trading-journal/internal/service"
 	"github.com/trogers1052/trading-journal/internal/telegram"
 )
@@ -68,8 +69,21 @@ func main() {
 		log.Fatalf("Failed to create Telegram bot: %v", err)
 	}
 
+	// Connect to Redis for risk metrics snapshots (optional — nil if unavailable)
+	var redisClient *tjredis.Client
+	if cfg.RedisAddr != "" {
+		redisClient = tjredis.NewClient(cfg.RedisAddr, cfg.RedisPassword, cfg.RedisDB)
+		if err := redisClient.Ping(context.Background()); err != nil {
+			log.Printf("Warning: Redis unavailable (%v) — risk metrics at entry will be skipped", err)
+			redisClient.Close()
+			redisClient = nil
+		} else {
+			log.Printf("  Redis: %s (for risk metrics snapshots)", cfg.RedisAddr)
+		}
+	}
+
 	// Create journal service
-	journalService := service.NewJournalService(repo, bot)
+	journalService := service.NewJournalService(repo, bot, redisClient)
 
 	// Create Kafka consumer
 	consumer, err := kafka.NewConsumer(
@@ -176,7 +190,15 @@ func main() {
 		log.Println("Stopping Telegram bot...")
 		bot.Stop()
 
-		// 4. Close database connection pool last (other components may still
+		// 4. Close Redis client.
+		if redisClient != nil {
+			log.Println("Closing Redis connection...")
+			if err := redisClient.Close(); err != nil {
+				log.Printf("Warning: Redis close error: %v", err)
+			}
+		}
+
+		// 5. Close database connection pool last (other components may still
 		//    flush writes during their own shutdown).
 		log.Println("Closing database connection...")
 		if err := repo.Close(); err != nil {

@@ -11,6 +11,7 @@ import (
 
 	"github.com/trogers1052/trading-journal/internal/database"
 	"github.com/trogers1052/trading-journal/internal/models"
+	tjredis "github.com/trogers1052/trading-journal/internal/redis"
 	"github.com/trogers1052/trading-journal/internal/telegram"
 )
 
@@ -18,16 +19,19 @@ import (
 type JournalService struct {
 	repo             *database.Repository
 	bot              *telegram.Bot
+	redisClient      *tjredis.Client  // Optional — nil if Redis unavailable
 	pendingPositions []*models.Position // Queue of positions needing journal entries
 	catchupMode      bool               // True during startup Kafka replay - suppresses notifications
 	mu               sync.Mutex
 }
 
-// NewJournalService creates a new journal service
-func NewJournalService(repo *database.Repository, bot *telegram.Bot) *JournalService {
+// NewJournalService creates a new journal service.
+// redisClient may be nil; risk metrics will be skipped if unavailable.
+func NewJournalService(repo *database.Repository, bot *telegram.Bot, redisClient *tjredis.Client) *JournalService {
 	svc := &JournalService{
 		repo:        repo,
 		bot:         bot,
+		redisClient: redisClient,
 		catchupMode: true, // Start in catchup mode - will be disabled after initial Kafka replay
 	}
 
@@ -119,20 +123,8 @@ func (s *JournalService) HandleTradeEvent(ctx context.Context, event *models.Tra
 		return nil
 	}
 
-	// Insert the trade.  InsertTrade returns ErrDuplicateTrade when a
-	// concurrent Kafka consumer beat us to the insert (TOCTOU race between
-	// the GetTradeByOrderID check above and the actual INSERT).  In that case
-	// trade.ID is populated with the existing row's id and we must stop here
-	// — the winning goroutine will handle position creation.
-	if err := s.repo.InsertTrade(trade); err != nil {
-		if errors.Is(err, database.ErrDuplicateTrade) {
-			log.Printf("Trade %s already processed (concurrent insert), skipping", trade.OrderID)
-			return nil
-		}
-		return fmt.Errorf("failed to insert trade: %w", err)
-	}
-
-	// Handle based on side
+	// Handle based on side — each path atomically inserts the trade and
+	// creates/closes the position in a single database transaction.
 	if data.Side == "buy" {
 		return s.handleBuyTrade(trade)
 	} else if data.Side == "sell" {
@@ -156,15 +148,25 @@ func (s *JournalService) handleBuyTrade(trade *models.Trade) error {
 		log.Printf("Adding to existing position for %s", trade.Symbol)
 	}
 
-	// Create a new position
-	position, err := s.repo.CreatePosition(trade)
-	if err != nil {
-		return fmt.Errorf("failed to create position: %w", err)
+	// Snapshot risk metrics from Redis (regime, RSI, ATR, VIX, etc.)
+	var riskMetrics []byte
+	if s.redisClient != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		riskMetrics = s.redisClient.SnapshotRiskMetrics(ctx, trade.Symbol)
+		cancel()
+		if riskMetrics != nil {
+			log.Printf("Captured risk metrics at entry for %s", trade.Symbol)
+		}
 	}
 
-	// Link the trade to the position
-	if err := s.repo.UpdateTradePositionID(trade.OrderID, position.ID); err != nil {
-		log.Printf("Warning: failed to link trade to position: %v", err)
+	// Atomically insert the trade, create a position, and link them
+	position, err := s.repo.InsertTradeAndOpenPosition(trade, riskMetrics)
+	if err != nil {
+		if errors.Is(err, database.ErrDuplicateTrade) {
+			log.Printf("Trade %s already processed (concurrent insert), skipping", trade.OrderID)
+			return nil
+		}
+		return fmt.Errorf("failed to insert trade and create position: %w", err)
 	}
 
 	log.Printf("Created new position %d for %s", position.ID, trade.Symbol)
@@ -185,14 +187,13 @@ func (s *JournalService) handleSellTrade(trade *models.Trade) error {
 		return nil
 	}
 
-	// Close the position
-	if err := s.repo.ClosePosition(position.ID, trade); err != nil {
-		return fmt.Errorf("failed to close position: %w", err)
-	}
-
-	// Link the trade to the position
-	if err := s.repo.UpdateTradePositionID(trade.OrderID, position.ID); err != nil {
-		log.Printf("Warning: failed to link trade to position: %v", err)
+	// Atomically insert the trade, close the position, and link them
+	if err := s.repo.InsertTradeAndClosePosition(trade, position.ID); err != nil {
+		if errors.Is(err, database.ErrDuplicateTrade) {
+			log.Printf("Trade %s already processed (concurrent insert), skipping", trade.OrderID)
+			return nil
+		}
+		return fmt.Errorf("failed to insert trade and close position: %w", err)
 	}
 
 	// Refresh position data with P&L calculated
