@@ -325,7 +325,7 @@ func (r *Repository) ClosePosition(positionID int64, exitTrade *models.Trade) er
 	}
 
 	// Calculate P&L
-	realizedPL := (exitTrade.Price - position.EntryPrice) * exitTrade.Quantity
+	realizedPL := (exitTrade.Price*exitTrade.Quantity - exitTrade.Fees) - (position.EntryPrice * exitTrade.Quantity)
 	realizedPLPct := ((exitTrade.Price - position.EntryPrice) / position.EntryPrice) * 100
 	holdingDays := int(exitTrade.ExecutedAt.Sub(position.EntryDate).Hours() / 24)
 
@@ -561,22 +561,36 @@ func (r *Repository) GetJournalStats() (map[string]interface{}, error) {
 
 	// Total positions
 	var totalPositions, closedPositions, journaledPositions int
-	r.db.QueryRow(`SELECT COUNT(*) FROM journal_positions`).Scan(&totalPositions)
-	r.db.QueryRow(`SELECT COUNT(*) FROM journal_positions WHERE status = 'closed'`).Scan(&closedPositions)
-	r.db.QueryRow(`SELECT COUNT(*) FROM journal_entries`).Scan(&journaledPositions)
+	if err := r.db.QueryRow(`SELECT COUNT(*) FROM journal_positions`).Scan(&totalPositions); err != nil {
+		return nil, fmt.Errorf("failed to get total positions: %w", err)
+	}
+	if err := r.db.QueryRow(`SELECT COUNT(*) FROM journal_positions WHERE status = 'closed'`).Scan(&closedPositions); err != nil {
+		return nil, fmt.Errorf("failed to get closed positions: %w", err)
+	}
+	if err := r.db.QueryRow(`SELECT COUNT(*) FROM journal_entries`).Scan(&journaledPositions); err != nil {
+		return nil, fmt.Errorf("failed to get journaled positions: %w", err)
+	}
 
 	// Win rate from journaled trades
 	var wins, losses int
-	r.db.QueryRow(`SELECT COUNT(*) FROM journal_positions WHERE status = 'closed' AND realized_pl > 0`).Scan(&wins)
-	r.db.QueryRow(`SELECT COUNT(*) FROM journal_positions WHERE status = 'closed' AND realized_pl <= 0`).Scan(&losses)
+	if err := r.db.QueryRow(`SELECT COUNT(*) FROM journal_positions WHERE status = 'closed' AND realized_pl > 0`).Scan(&wins); err != nil {
+		return nil, fmt.Errorf("failed to get wins: %w", err)
+	}
+	if err := r.db.QueryRow(`SELECT COUNT(*) FROM journal_positions WHERE status = 'closed' AND realized_pl <= 0`).Scan(&losses); err != nil {
+		return nil, fmt.Errorf("failed to get losses: %w", err)
+	}
 
 	// Average rating
 	var avgRating float64
-	r.db.QueryRow(`SELECT COALESCE(AVG(rating), 0) FROM journal_entries`).Scan(&avgRating)
+	if err := r.db.QueryRow(`SELECT COALESCE(AVG(rating), 0) FROM journal_entries`).Scan(&avgRating); err != nil {
+		return nil, fmt.Errorf("failed to get average rating: %w", err)
+	}
 
 	// Total P&L
 	var totalPL float64
-	r.db.QueryRow(`SELECT COALESCE(SUM(realized_pl), 0) FROM journal_positions WHERE status = 'closed'`).Scan(&totalPL)
+	if err := r.db.QueryRow(`SELECT COALESCE(SUM(realized_pl), 0) FROM journal_positions WHERE status = 'closed'`).Scan(&totalPL); err != nil {
+		return nil, fmt.Errorf("failed to get total P&L: %w", err)
+	}
 
 	stats["total_positions"] = totalPositions
 	stats["closed_positions"] = closedPositions
