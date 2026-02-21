@@ -341,7 +341,12 @@ func (r *Repository) ClosePosition(positionID int64, exitTrade *models.Trade) er
 
 	// Calculate P&L (subtract both entry and exit fees)
 	realizedPL := (exitTrade.Price*exitTrade.Quantity - exitTrade.Fees) - (position.EntryPrice*exitTrade.Quantity + entryFees)
-	realizedPLPct := ((exitTrade.Price - position.EntryPrice) / position.EntryPrice) * 100
+	// P&L percentage includes fees for accurate return tracking
+	totalCost := position.EntryPrice*exitTrade.Quantity + entryFees
+	realizedPLPct := 0.0
+	if totalCost > 0 {
+		realizedPLPct = (realizedPL / totalCost) * 100
+	}
 	holdingDays := int(exitTrade.ExecutedAt.Sub(position.EntryDate).Hours() / 24)
 
 	query := `
