@@ -2,12 +2,18 @@ package database
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 
 	"github.com/lib/pq"
 	"github.com/trogers1052/trading-journal/internal/models"
 )
+
+// ErrDuplicateTrade is returned by InsertTrade when the order_id already
+// exists in the database (concurrent insert race).  The caller should treat
+// this as a successful no-op and skip further processing for the trade.
+var ErrDuplicateTrade = errors.New("trade already exists")
 
 // Repository handles database operations for the trading journal
 type Repository struct {
@@ -162,8 +168,22 @@ func (r *Repository) runMigrations() error {
 	return nil
 }
 
-// InsertTrade inserts a new trade record
+// InsertTrade inserts a new trade record.
+//
+// Returns ErrDuplicateTrade (and populates trade.ID with the existing row's
+// id) when the order_id already exists.  This can happen in a concurrent-
+// insert race between two Kafka consumer goroutines: both pass the
+// GetTradeByOrderID pre-check and one loses the database unique-constraint
+// race.  Callers must check for ErrDuplicateTrade and skip further processing
+// to avoid creating duplicate positions.
+//
+// An empty order_id is rejected immediately to prevent degenerate rows that
+// cannot be deduplicated.
 func (r *Repository) InsertTrade(trade *models.Trade) error {
+	if trade.OrderID == "" {
+		return fmt.Errorf("trade has empty order_id: cannot safely deduplicate")
+	}
+
 	query := `
 		INSERT INTO journal_trades (order_id, symbol, side, quantity, price, total_amount, fees, executed_at, position_id)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
@@ -184,11 +204,23 @@ func (r *Repository) InsertTrade(trade *models.Trade) error {
 		trade.PositionID,
 	).Scan(&trade.ID)
 
-	if err == sql.ErrNoRows {
-		// Trade already exists
-		return nil
+	if err != sql.ErrNoRows {
+		// Either success (trade.ID populated) or a real database error.
+		return err
 	}
-	return err
+
+	// ON CONFLICT DO NOTHING fired — a concurrent insert won the race.
+	// Fetch the existing row's ID so the caller has a valid trade.ID and
+	// can detect the duplicate without creating downstream phantom state.
+	fetchErr := r.db.QueryRow(
+		`SELECT id FROM journal_trades WHERE order_id = $1`,
+		trade.OrderID,
+	).Scan(&trade.ID)
+	if fetchErr != nil {
+		return fmt.Errorf("trade conflict detected but could not fetch existing id: %w", fetchErr)
+	}
+
+	return ErrDuplicateTrade
 }
 
 // GetTradeByOrderID retrieves a trade by order ID

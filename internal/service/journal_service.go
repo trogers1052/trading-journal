@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"strconv"
@@ -96,8 +97,16 @@ func (s *JournalService) HandleTradeEvent(ctx context.Context, event *models.Tra
 		return nil
 	}
 
-	// Insert the trade
+	// Insert the trade.  InsertTrade returns ErrDuplicateTrade when a
+	// concurrent Kafka consumer beat us to the insert (TOCTOU race between
+	// the GetTradeByOrderID check above and the actual INSERT).  In that case
+	// trade.ID is populated with the existing row's id and we must stop here
+	// — the winning goroutine will handle position creation.
 	if err := s.repo.InsertTrade(trade); err != nil {
+		if errors.Is(err, database.ErrDuplicateTrade) {
+			log.Printf("Trade %s already processed (concurrent insert), skipping", trade.OrderID)
+			return nil
+		}
 		return fmt.Errorf("failed to insert trade: %w", err)
 	}
 
