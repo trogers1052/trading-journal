@@ -23,6 +23,8 @@ import (
 const shutdownTimeout = 15 * time.Second
 
 func main() {
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
+
 	log.Println("Starting trading-journal service...")
 
 	// Health endpoint — Docker/systemd HEALTHCHECK target

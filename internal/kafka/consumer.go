@@ -141,10 +141,15 @@ func (h *consumerGroupHandler) ConsumeClaim(session sarama.ConsumerGroupSession,
 
 				// Only process TRADE_DETECTED events
 				if event.EventType == "TRADE_DETECTED" {
+					log.Printf("Received trade event: %s %s %s @ %s (order=%s, offset=%d)",
+						event.Data.Side, event.Data.Quantity, event.Data.Symbol,
+						event.Data.AveragePrice, event.Data.OrderID, message.Offset)
 					if err := h.consumer.tradeHandler(ctx, &event); err != nil {
 						log.Printf("Failed to handle trade event: %v", err)
 						continue
 					}
+				} else {
+					log.Printf("Ignoring non-trade event: %s (offset=%d)", event.EventType, message.Offset)
 				}
 			}
 
