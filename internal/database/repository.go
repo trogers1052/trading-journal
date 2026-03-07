@@ -615,6 +615,7 @@ func (r *Repository) InsertTradeAndOpenPosition(trade *models.Trade, riskMetrics
 		return nil, fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
+	log.Printf("Trade recorded to DB: BUY %s (order=%s, position_id=%d)", trade.Symbol, trade.OrderID, position.ID)
 	return position, nil
 }
 
@@ -650,6 +651,7 @@ func (r *Repository) InsertTradeAndClosePosition(trade *models.Trade, positionID
 		return fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
+	log.Printf("Trade recorded to DB: SELL %s (order=%s, position_id=%d closed)", trade.Symbol, trade.OrderID, positionID)
 	return nil
 }
 
