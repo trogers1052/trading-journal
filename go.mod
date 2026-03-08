@@ -1,6 +1,6 @@
 module github.com/trogers1052/trading-journal
 
-go 1.21
+go 1.24
 
 require (
 	github.com/IBM/sarama v1.43.0
