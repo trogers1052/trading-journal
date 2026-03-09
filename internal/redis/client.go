@@ -8,6 +8,7 @@ import (
 	"time"
 
 	goredis "github.com/redis/go-redis/v9"
+	"github.com/trogers1052/trading-journal/internal/metrics"
 )
 
 // Client reads market context and indicator data from Redis for risk metric snapshots.
@@ -66,6 +67,7 @@ func (c *Client) SnapshotRiskMetrics(ctx context.Context, symbol string) []byte 
 			}
 		}
 	} else {
+		metrics.RedisSnapshotErrors.Inc()
 		log.Printf("risk_metrics: market:context unavailable: %v", err)
 	}
 
@@ -87,6 +89,7 @@ func (c *Client) SnapshotRiskMetrics(ctx context.Context, symbol string) []byte 
 			}
 		}
 	} else {
+		metrics.RedisSnapshotErrors.Inc()
 		log.Printf("risk_metrics: %s unavailable: %v", indicatorKey, err)
 	}
 
@@ -98,6 +101,7 @@ func (c *Client) SnapshotRiskMetrics(ctx context.Context, symbol string) []byte 
 
 	data, err := json.Marshal(snapshot)
 	if err != nil {
+		metrics.RedisSnapshotErrors.Inc()
 		log.Printf("risk_metrics: failed to marshal snapshot: %v", err)
 		return nil
 	}

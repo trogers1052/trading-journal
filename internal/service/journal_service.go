@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/trogers1052/trading-journal/internal/database"
+	"github.com/trogers1052/trading-journal/internal/metrics"
 	"github.com/trogers1052/trading-journal/internal/models"
 	tjredis "github.com/trogers1052/trading-journal/internal/redis"
 	"github.com/trogers1052/trading-journal/internal/telegram"
@@ -23,6 +24,7 @@ type JournalService struct {
 	pendingPositions []*models.Position // Queue of positions needing journal entries
 	catchupMode      bool               // True during startup Kafka replay - suppresses notifications
 	mu               sync.Mutex
+	symbolMu         sync.Map           // Per-symbol mutexes to prevent concurrent buy+sell races
 }
 
 // NewJournalService creates a new journal service.
@@ -34,11 +36,18 @@ func NewJournalService(repo *database.Repository, bot *telegram.Bot, redisClient
 		redisClient: redisClient,
 		catchupMode: true, // Start in catchup mode - will be disabled after initial Kafka replay
 	}
+	metrics.CatchupMode.Set(1)
 
 	// Set up the callback for when journal entries are complete
 	bot.SetJournalCompleteCallback(svc.onJournalComplete)
 
 	return svc
+}
+
+// getSymbolLock returns a per-symbol mutex for serializing trade operations.
+func (s *JournalService) getSymbolLock(symbol string) *sync.Mutex {
+	val, _ := s.symbolMu.LoadOrStore(symbol, &sync.Mutex{})
+	return val.(*sync.Mutex)
 }
 
 // SetCatchupMode enables/disables catchup mode (suppresses notifications during Kafka replay)
@@ -47,8 +56,10 @@ func (s *JournalService) SetCatchupMode(enabled bool) {
 	defer s.mu.Unlock()
 	s.catchupMode = enabled
 	if enabled {
+		metrics.CatchupMode.Set(1)
 		log.Println("Catchup mode enabled - notifications suppressed")
 	} else {
+		metrics.CatchupMode.Set(0)
 		log.Println("Catchup mode disabled - live notifications enabled")
 	}
 }
@@ -122,6 +133,12 @@ func (s *JournalService) HandleTradeEvent(ctx context.Context, event *models.Tra
 		log.Printf("Trade %s already processed, skipping", trade.OrderID)
 		return nil
 	}
+
+	// Acquire per-symbol lock to prevent concurrent buy+sell races on the
+	// same symbol (e.g., from different Kafka partitions).
+	mu := s.getSymbolLock(trade.Symbol)
+	mu.Lock()
+	defer mu.Unlock()
 
 	// Handle based on side — each path atomically inserts the trade and
 	// creates/closes the position in a single database transaction.
@@ -202,6 +219,8 @@ func (s *JournalService) handleSellTrade(trade *models.Trade) error {
 		return fmt.Errorf("failed to get closed position: %w", err)
 	}
 
+	metrics.PositionsClosed.Inc()
+
 	log.Printf("Closed position %d for %s (P&L: $%.2f)",
 		position.ID, trade.Symbol, *closedPosition.RealizedPL)
 
@@ -226,6 +245,8 @@ func (s *JournalService) onJournalComplete(entry *models.JournalEntry) error {
 	if err := s.repo.InsertJournalEntry(entry); err != nil {
 		return fmt.Errorf("failed to save journal entry: %w", err)
 	}
+
+	metrics.EntriesCreated.Inc()
 
 	log.Printf("Saved journal entry for position %d (%s)", entry.PositionID, entry.Symbol)
 
@@ -254,6 +275,8 @@ func (s *JournalService) CatchUpPendingJournals() error {
 	s.mu.Lock()
 	s.pendingPositions = positions
 	s.mu.Unlock()
+
+	metrics.PendingEntries.Set(float64(len(positions)))
 
 	// Send a simple count message, not the full list
 	s.bot.SendMessage(fmt.Sprintf("📋 You have %d trades pending journal entries. Let's go through them one at a time.", len(positions)))
@@ -288,6 +311,8 @@ func (s *JournalService) promptNextPendingPosition() {
 	s.pendingPositions = s.pendingPositions[1:]
 	remaining := len(s.pendingPositions)
 	s.mu.Unlock()
+
+	metrics.PendingEntries.Set(float64(remaining))
 
 	log.Printf("Prompting for position %d (%s), %d remaining", position.ID, position.Symbol, remaining)
 

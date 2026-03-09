@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"github.com/IBM/sarama"
+	"github.com/trogers1052/trading-journal/internal/metrics"
 	"github.com/trogers1052/trading-journal/internal/models"
 )
 
@@ -121,6 +122,8 @@ func (h *consumerGroupHandler) ConsumeClaim(session sarama.ConsumerGroupSession,
 				return nil
 			}
 
+			metrics.KafkaConsumed.Inc()
+
 			ctx := session.Context()
 
 			if h.consumer.tradeHandler != nil {
@@ -144,6 +147,7 @@ func (h *consumerGroupHandler) ConsumeClaim(session sarama.ConsumerGroupSession,
 					log.Printf("Received trade event: %s %s %s @ %s (order=%s, offset=%d)",
 						event.Data.Side, event.Data.Quantity, event.Data.Symbol,
 						event.Data.AveragePrice, event.Data.OrderID, message.Offset)
+					metrics.TradesConsumed.WithLabelValues(event.Data.Side).Inc()
 					if err := h.consumer.tradeHandler(ctx, &event); err != nil {
 						log.Printf("Failed to handle trade event: %v", err)
 						continue

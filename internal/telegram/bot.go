@@ -10,6 +10,7 @@ import (
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	"github.com/trogers1052/trading-journal/internal/metrics"
 	"github.com/trogers1052/trading-journal/internal/models"
 )
 
@@ -395,7 +396,10 @@ func (b *Bot) HasActivePrompt() bool {
 func (b *Bot) sendMessage(text string) {
 	msg := tgbotapi.NewMessage(b.chatID, text)
 	if _, err := b.api.Send(msg); err != nil {
+		metrics.TelegramPrompts.WithLabelValues("failed").Inc()
 		log.Printf("Failed to send message: %v", err)
+	} else {
+		metrics.TelegramPrompts.WithLabelValues("success").Inc()
 	}
 }
 
@@ -409,7 +413,10 @@ func (b *Bot) sendHTMLMessage(text string) {
 	msg := tgbotapi.NewMessage(b.chatID, text)
 	msg.ParseMode = tgbotapi.ModeHTML
 	if _, err := b.api.Send(msg); err != nil {
+		metrics.TelegramPrompts.WithLabelValues("failed").Inc()
 		log.Printf("Failed to send HTML message: %v", err)
+	} else {
+		metrics.TelegramPrompts.WithLabelValues("success").Inc()
 	}
 }
 

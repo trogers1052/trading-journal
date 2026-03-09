@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/lib/pq"
+	"github.com/trogers1052/trading-journal/internal/metrics"
 	"github.com/trogers1052/trading-journal/internal/models"
 )
 
@@ -162,6 +163,8 @@ func (r *Repository) runMigrations() error {
 		`CREATE INDEX IF NOT EXISTS idx_journal_positions_exit_type ON journal_positions(exit_type)`,
 		`CREATE INDEX IF NOT EXISTS idx_journal_positions_analyzed_at ON journal_positions(analyzed_at)`,
 		`CREATE INDEX IF NOT EXISTS idx_journal_positions_entry_signal_type ON journal_positions(entry_signal_type)`,
+		// Prevent multiple open positions per symbol (DB-level safety net for concurrent race)
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_journal_positions_one_open_per_symbol ON journal_positions(symbol) WHERE status = 'open'`,
 	}
 
 	for _, idx := range indexes {
@@ -456,6 +459,8 @@ func (r *Repository) GetClosedPositionsWithoutJournal() ([]*models.Position, err
 
 // InsertJournalEntry inserts a new journal entry
 func (r *Repository) InsertJournalEntry(entry *models.JournalEntry) error {
+	start := time.Now()
+
 	query := `
 		INSERT INTO journal_entries (
 			position_id, symbol, entry_reasoning, exit_reasoning, what_worked,
@@ -466,7 +471,7 @@ func (r *Repository) InsertJournalEntry(entry *models.JournalEntry) error {
 		RETURNING id, created_at, updated_at
 	`
 
-	return r.db.QueryRow(
+	err := r.db.QueryRow(
 		query,
 		entry.PositionID,
 		entry.Symbol,
@@ -481,6 +486,14 @@ func (r *Repository) InsertJournalEntry(entry *models.JournalEntry) error {
 		pq.Array(entry.Tags),
 		entry.Notes,
 	).Scan(&entry.ID, &entry.CreatedAt, &entry.UpdatedAt)
+
+	if err != nil {
+		metrics.DBWriteErrors.Inc()
+		return err
+	}
+
+	metrics.DBWriteDuration.Observe(time.Since(start).Seconds())
+	return nil
 }
 
 // GetJournalEntryByPositionID retrieves a journal entry by position ID
@@ -586,20 +599,27 @@ func (r *Repository) UpdateTradePositionID(orderID string, positionID int64) err
 // ErrDuplicateTrade if the trade's order_id already exists.
 // riskMetrics is optional JSONB data to store in risk_metrics_at_entry (nil to skip).
 func (r *Repository) InsertTradeAndOpenPosition(trade *models.Trade, riskMetrics []byte) (*models.Position, error) {
+	start := time.Now()
+
 	tx, err := r.db.Begin()
 	if err != nil {
+		metrics.DBWriteErrors.Inc()
 		return nil, fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer tx.Rollback()
 
 	// Insert the trade
 	if err := r.insertTradeWithTx(tx, trade); err != nil {
+		if !errors.Is(err, ErrDuplicateTrade) {
+			metrics.DBWriteErrors.Inc()
+		}
 		return nil, err
 	}
 
 	// Create the position
 	position, err := r.createPositionWithTx(tx, trade, riskMetrics)
 	if err != nil {
+		metrics.DBWriteErrors.Inc()
 		return nil, fmt.Errorf("failed to create position: %w", err)
 	}
 
@@ -608,12 +628,16 @@ func (r *Repository) InsertTradeAndOpenPosition(trade *models.Trade, riskMetrics
 		`UPDATE journal_trades SET position_id = $1 WHERE order_id = $2`,
 		position.ID, trade.OrderID,
 	); err != nil {
+		metrics.DBWriteErrors.Inc()
 		return nil, fmt.Errorf("failed to link trade to position: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
+		metrics.DBWriteErrors.Inc()
 		return nil, fmt.Errorf("failed to commit transaction: %w", err)
 	}
+
+	metrics.DBWriteDuration.Observe(time.Since(start).Seconds())
 
 	log.Printf("Trade recorded to DB: BUY %s (order=%s, position_id=%d)", trade.Symbol, trade.OrderID, position.ID)
 	return position, nil
@@ -623,19 +647,26 @@ func (r *Repository) InsertTradeAndOpenPosition(trade *models.Trade, riskMetrics
 // given position with P&L calculation, and links them together. Returns
 // ErrDuplicateTrade if the trade's order_id already exists.
 func (r *Repository) InsertTradeAndClosePosition(trade *models.Trade, positionID int64) error {
+	start := time.Now()
+
 	tx, err := r.db.Begin()
 	if err != nil {
+		metrics.DBWriteErrors.Inc()
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer tx.Rollback()
 
 	// Insert the trade
 	if err := r.insertTradeWithTx(tx, trade); err != nil {
+		if !errors.Is(err, ErrDuplicateTrade) {
+			metrics.DBWriteErrors.Inc()
+		}
 		return err
 	}
 
 	// Close the position
 	if err := r.closePositionWithTx(tx, positionID, trade); err != nil {
+		metrics.DBWriteErrors.Inc()
 		return fmt.Errorf("failed to close position: %w", err)
 	}
 
@@ -644,12 +675,16 @@ func (r *Repository) InsertTradeAndClosePosition(trade *models.Trade, positionID
 		`UPDATE journal_trades SET position_id = $1 WHERE order_id = $2`,
 		positionID, trade.OrderID,
 	); err != nil {
+		metrics.DBWriteErrors.Inc()
 		return fmt.Errorf("failed to link trade to position: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
+		metrics.DBWriteErrors.Inc()
 		return fmt.Errorf("failed to commit transaction: %w", err)
 	}
+
+	metrics.DBWriteDuration.Observe(time.Since(start).Seconds())
 
 	log.Printf("Trade recorded to DB: SELL %s (order=%s, position_id=%d closed)", trade.Symbol, trade.OrderID, positionID)
 	return nil
